@@ -54,7 +54,7 @@ type ComDetails struct {
 	Service   string `json:"service" yaml:"service" csv:"Service"`
 	Pod       string `json:"pod" yaml:"pod" csv:"Pod"`
 	Container string `json:"container" yaml:"container" csv:"Container"`
-	NodePool  string `json:"nodePool" yaml:"nodePool" csv:"NodePool"`
+	NodeGroup string `json:"nodeGroup" yaml:"nodeGroup" csv:"NodeGroup"`
 	Optional  bool   `json:"optional" yaml:"optional" csv:"Optional"`
 }
 
@@ -112,7 +112,7 @@ func (m *ComMatrix) String() string {
 
 func (m *ComMatrix) WriteMatrixToFileByType(utilsHelpers utils.UtilsInterface, fileNamePrefix, format string, deployment Deployment, destDir string) error {
 	if format == FormatNFT {
-		pools := m.SeparateMatrixByPool()
+		pools := m.SeparateMatrixByGroup()
 		for poolName, mat := range pools {
 			if len(mat.Matrix) == 0 {
 				continue
@@ -146,24 +146,11 @@ func (m *ComMatrix) print(format string) ([]byte, error) {
 	}
 }
 
-func (m *ComMatrix) SeparateMatrixByRole() (ComMatrix, ComMatrix) {
-	var masterMatrix, workerMatrix ComMatrix
-	for _, entry := range m.Matrix {
-		if entry.NodePool == "master" {
-			masterMatrix.Matrix = append(masterMatrix.Matrix, entry)
-		} else if entry.NodePool == "worker" {
-			workerMatrix.Matrix = append(workerMatrix.Matrix, entry)
-		}
-	}
-
-	return masterMatrix, workerMatrix
-}
-
-// SeparateMatrixByPool groups matrix entries by their pool name (stored in NodePool).
-func (m *ComMatrix) SeparateMatrixByPool() map[string]ComMatrix {
+// SeparateMatrixByGroup groups matrix entries by their group name (stored in NodeGroup).
+func (m *ComMatrix) SeparateMatrixByGroup() map[string]ComMatrix {
 	res := make(map[string]ComMatrix)
 	for _, entry := range m.Matrix {
-		pool := entry.NodePool
+		pool := entry.NodeGroup
 		if pool == "" {
 			continue
 		}
@@ -241,7 +228,7 @@ func (m *ComMatrix) SortAndRemoveDuplicates() {
 	allKeys := make(map[string]bool)
 	res := []ComDetails{}
 	for _, item := range m.Matrix {
-		str := fmt.Sprintf("%s-%d-%s", item.NodePool, item.Port, item.Protocol)
+		str := fmt.Sprintf("%s-%d-%s", item.NodeGroup, item.Port, item.Protocol)
 		if _, value := allKeys[str]; !value {
 			allKeys[str] = true
 			res = append(res, item)
@@ -250,7 +237,7 @@ func (m *ComMatrix) SortAndRemoveDuplicates() {
 	m.Matrix = res
 
 	slices.SortFunc(m.Matrix, func(a, b ComDetails) int {
-		res := cmp.Compare(a.NodePool, b.NodePool)
+		res := cmp.Compare(a.NodeGroup, b.NodeGroup)
 		if res != 0 {
 			return res
 		}
@@ -265,12 +252,12 @@ func (m *ComMatrix) SortAndRemoveDuplicates() {
 }
 
 func (cd ComDetails) String() string {
-	return fmt.Sprintf("%s,%s,%d,%s,%s,%s,%s,%s,%v", cd.Direction, cd.Protocol, cd.Port, cd.Namespace, cd.Service, cd.Pod, cd.Container, cd.NodePool, cd.Optional)
+	return fmt.Sprintf("%s,%s,%d,%s,%s,%s,%s,%s,%v", cd.Direction, cd.Protocol, cd.Port, cd.Namespace, cd.Service, cd.Pod, cd.Container, cd.NodeGroup, cd.Optional)
 }
 
 func (cd ComDetails) Equals(other ComDetails) bool {
-	strComDetail1 := fmt.Sprintf("%s-%d-%s", cd.NodePool, cd.Port, cd.Protocol)
-	strComDetail2 := fmt.Sprintf("%s-%d-%s", other.NodePool, other.Port, other.Protocol)
+	strComDetail1 := fmt.Sprintf("%s-%d-%s", cd.NodeGroup, cd.Port, cd.Protocol)
+	strComDetail2 := fmt.Sprintf("%s-%d-%s", other.NodeGroup, other.Port, other.Protocol)
 
 	return strComDetail1 == strComDetail2
 }

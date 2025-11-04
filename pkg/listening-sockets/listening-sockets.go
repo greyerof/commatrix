@@ -1,6 +1,7 @@
 package listeningsockets
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"path"
@@ -29,22 +30,44 @@ const (
 
 type ConnectionCheck struct {
 	*client.ClientSet
-	podUtils   utils.UtilsInterface
-	destDir    string
-	nodeToPool map[string]string
+	podUtils    utils.UtilsInterface
+	destDir     string
+	nodeToGroup map[string]string
 }
 
 func NewCheck(c *client.ClientSet, podUtils utils.UtilsInterface, destDir string) (*ConnectionCheck, error) {
-	nodeToPool, err := mcp.ResolveNodeToPool(c)
-	if err != nil {
-		return nil, err
+	// Try MCP-based resolution first
+	if nodeToPool, err := mcp.ResolveNodeToPool(c); err == nil {
+		return &ConnectionCheck{
+			ClientSet:   c,
+			podUtils:    podUtils,
+			destDir:     destDir,
+			nodeToGroup: nodeToPool,
+		}, nil
 	}
 
+	// Fallback: build node->group map (HyperShift or clusters without MCP): prefer NodePool label, else role
+	nodeList := &corev1.NodeList{}
+	if err := c.List(context.TODO(), nodeList); err != nil {
+		return nil, err
+	}
+	nodeToRole := make(map[string]string, len(nodeList.Items))
+	for _, node := range nodeList.Items {
+		if np, ok := node.Labels["hypershift.openshift.io/nodePool"]; ok && np != "" {
+			nodeToRole[node.Name] = np
+			continue
+		}
+		role, err := types.GetNodeRole(&node)
+		if err != nil {
+			return nil, err
+		}
+		nodeToRole[node.Name] = role
+	}
 	return &ConnectionCheck{
-		c,
-		podUtils,
-		destDir,
-		nodeToPool,
+		ClientSet:   c,
+		podUtils:    podUtils,
+		destDir:     destDir,
+		nodeToGroup: nodeToRole,
 	}, nil
 }
 
@@ -54,7 +77,7 @@ func (cc *ConnectionCheck) GenerateSS(namespace string) (*types.ComMatrix, []byt
 
 	nLock := &sync.Mutex{}
 	g := new(errgroup.Group)
-	for nodeName := range cc.nodeToPool {
+	for nodeName := range cc.nodeToGroup {
 		name := nodeName
 		g.Go(func() error {
 			debugPod, err := cc.podUtils.CreatePodOnNode(name, namespace, consts.DefaultDebugPodImage, []string{})
@@ -74,7 +97,8 @@ func (cc *ConnectionCheck) GenerateSS(namespace string) (*types.ComMatrix, []byt
 				}
 			}()
 
-			cds, ssTCP, ssUDP, err := cc.createSSOutputFromNode(debugPod, name)
+			group := cc.nodeToGroup[name]
+			cds, ssTCP, ssUDP, err := cc.createSSOutputFromNode(debugPod, group)
 			if err != nil {
 				return err
 			}
@@ -115,7 +139,7 @@ func (cc *ConnectionCheck) WriteSSRawFiles(ssOutTCP, ssOutUDP []byte) error {
 	return nil
 }
 
-func (cc *ConnectionCheck) createSSOutputFromNode(debugPod *corev1.Pod, nodeName string) ([]types.ComDetails, []byte, []byte, error) {
+func (cc *ConnectionCheck) createSSOutputFromNode(debugPod *corev1.Pod, group string) ([]types.ComDetails, []byte, []byte, error) {
 	ssOutTCP, err := cc.podUtils.RunCommandOnPod(debugPod, []string{"/bin/sh", "-c", "ss -anpltH"})
 	if err != nil {
 		return nil, nil, nil, err
@@ -128,8 +152,8 @@ func (cc *ConnectionCheck) createSSOutputFromNode(debugPod *corev1.Pod, nodeName
 	ssOutFilteredTCP := filterEntries(splitByLines(ssOutTCP))
 	ssOutFilteredUDP := filterEntries(splitByLines(ssOutUDP))
 
-	tcpComDetails := cc.toComDetails(debugPod, ssOutFilteredTCP, "TCP", cc.nodeToPool[nodeName])
-	udpComDetails := cc.toComDetails(debugPod, ssOutFilteredUDP, "UDP", cc.nodeToPool[nodeName])
+	tcpComDetails := cc.toComDetails(debugPod, ssOutFilteredTCP, "TCP", group)
+	udpComDetails := cc.toComDetails(debugPod, ssOutFilteredUDP, "UDP", group)
 
 	res := []types.ComDetails{}
 	res = append(res, udpComDetails...)
@@ -163,7 +187,7 @@ func (cc *ConnectionCheck) toComDetails(debugPod *corev1.Pod, ssOutput []string,
 		cd.Namespace = nameSpace
 		cd.Pod = podName
 		cd.Protocol = protocol
-		cd.NodePool = pool
+		cd.NodeGroup = pool
 		cd.Optional = false
 		res = append(res, *cd)
 	}
