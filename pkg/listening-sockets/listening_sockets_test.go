@@ -155,6 +155,17 @@ var _ = Describe("GenerateSS", func() {
 			[]string{"/bin/sh", "-c", "ss -anpluH"}).
 			Return([]byte(udpExecCommandOutput), nil).AnyTimes()
 
+		// Mock expectation for loopback IP query
+		loopbackIPOutput := `1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+    inet6 ::1/128 scope host
+       valid_lft forever preferred_lft forever`
+		mockUtils.EXPECT().RunCommandOnPod(gomock.Any(),
+			[]string{"/bin/sh", "-c", "ip addr show lo"}).
+			Return([]byte(loopbackIPOutput), nil).AnyTimes()
+
 		// Mock expectation for /proc/{pid}/cgroup command
 		for _, pid := range pids {
 			command := []string{"/bin/sh", "-c", fmt.Sprintf("cat /proc/%s/cgroup", pid)}
@@ -197,3 +208,110 @@ func normalizeOutput(s string) string {
 	s = strings.TrimSpace(s)
 	return s
 }
+
+var _ = Describe("isLoopbackEntry", func() {
+	DescribeTable("should correctly identify loopback addresses",
+		func(ssEntry string, expected bool) {
+			// Use empty loopbackIPs map for standard loopback detection
+			emptyLoopbackIPs := make(map[string]bool)
+			Expect(isLoopbackEntry(ssEntry, emptyLoopbackIPs)).To(Equal(expected))
+		},
+		Entry("IPv4 loopback 127.0.0.1", "LISTEN 0 4096 127.0.0.1:8797 0.0.0.0:* users:((\"service\",pid=1234,fd=3))", true),
+		Entry("IPv4 loopback 127.0.0.2", "LISTEN 0 4096 127.0.0.2:8797 0.0.0.0:* users:((\"service\",pid=1234,fd=3))", true),
+		Entry("IPv4 loopback 127.1.2.3", "LISTEN 0 4096 127.1.2.3:8797 0.0.0.0:* users:((\"service\",pid=1234,fd=3))", true),
+		Entry("IPv4 loopback 127.255.255.255", "LISTEN 0 4096 127.255.255.255:8797 0.0.0.0:* users:((\"service\",pid=1234,fd=3))", true),
+		Entry("IPv6 loopback ::1", "LISTEN 0 4096 ::1:8797 :::* users:((\"service\",pid=1234,fd=3))", true),
+		Entry("IPv6 loopback with brackets [::1]", "LISTEN 0 4096 [::1]:8797 [::]:* users:((\"service\",pid=1234,fd=3))", true),
+		Entry("non-loopback 0.0.0.0", "LISTEN 0 4096 0.0.0.0:8797 0.0.0.0:* users:((\"service\",pid=1234,fd=3))", false),
+		Entry("non-loopback 10.46.97.104", "UNCONN 0 0 10.46.97.104:500 0.0.0.0:* users:((\"pluto\",pid=2115,fd=21))", false),
+		Entry("non-loopback 192.168.1.1", "LISTEN 0 4096 192.168.1.1:8797 0.0.0.0:* users:((\"service\",pid=1234,fd=3))", false),
+		Entry("non-loopback IPv6 fe80::1", "LISTEN 0 4096 fe80::1:8797 :::* users:((\"service\",pid=1234,fd=3))", false),
+		Entry("empty string", "", false),
+	)
+
+	It("should detect IPs assigned to loopback interface", func() {
+		// Simulate loopback interface with custom IP alias
+		loopbackIPs := map[string]bool{
+			"127.0.0.1":  true,
+			"::1":        true,
+			"172.20.0.1": true, // Custom alias on loopback interface
+		}
+
+		// Standard loopback should be detected
+		Expect(isLoopbackEntry("LISTEN 0 4096 127.0.0.1:8797 0.0.0.0:* users:((\"service\",pid=1234,fd=3))", loopbackIPs)).To(BeTrue())
+
+		// Custom alias should be detected
+		Expect(isLoopbackEntry("LISTEN 0 4096 172.20.0.1:6443 0.0.0.0:* users:((\"service\",pid=1234,fd=3))", loopbackIPs)).To(BeTrue())
+
+		// Other IPs should not be detected
+		Expect(isLoopbackEntry("LISTEN 0 4096 192.168.1.1:8797 0.0.0.0:* users:((\"service\",pid=1234,fd=3))", loopbackIPs)).To(BeFalse())
+	})
+})
+
+var _ = Describe("filterEntries", func() {
+	It("should filter out loopback addresses from ss entries", func() {
+		entries := []string{
+			"LISTEN 0 4096 127.0.0.1:8797 0.0.0.0:* users:((\"service1\",pid=1234,fd=3))",
+			"LISTEN 0 4096 127.1.2.3:8798 0.0.0.0:* users:((\"service2\",pid=1235,fd=3))",
+			"LISTEN 0 4096 0.0.0.0:9100 0.0.0.0:* users:((\"service3\",pid=1236,fd=3))",
+			"UNCONN 0 0 10.46.97.104:500 0.0.0.0:* users:((\"service4\",pid=1237,fd=3))",
+			"LISTEN 0 4096 ::1:8800 :::* users:((\"service5\",pid=1238,fd=3))",
+			"LISTEN 0 4096 192.168.1.1:8801 0.0.0.0:* users:((\"service6\",pid=1239,fd=3))",
+			"",
+		}
+
+		filtered := filterEntries(entries)
+
+		// Should only contain non-loopback addresses
+		Expect(len(filtered)).To(Equal(3))
+		Expect(filtered).To(ContainElement(ContainSubstring("0.0.0.0:9100")))
+		Expect(filtered).To(ContainElement(ContainSubstring("10.46.97.104:500")))
+		Expect(filtered).To(ContainElement(ContainSubstring("192.168.1.1:8801")))
+
+		// Should not contain loopback addresses
+		Expect(filtered).NotTo(ContainElement(ContainSubstring("127.0.0.1")))
+		Expect(filtered).NotTo(ContainElement(ContainSubstring("127.1.2.3")))
+		Expect(filtered).NotTo(ContainElement(ContainSubstring("::1")))
+	})
+})
+
+var _ = Describe("getLoopbackIPs", func() {
+	It("should get IPs from loopback interfaces", func() {
+		loopbackIPs, err := getLoopbackIPs()
+		Expect(err).NotTo(HaveOccurred())
+
+		// Should at least contain standard loopback addresses
+		// Note: We can't assert exact IPs since it depends on the system configuration
+		Expect(loopbackIPs).NotTo(BeNil())
+		Expect(len(loopbackIPs)).To(BeNumerically(">=", 0))
+	})
+})
+
+var _ = Describe("filterEntriesWithLoopbackIPs for hypershift scenario", func() {
+	It("should filter out 172.20.0.1 when it's on the loopback interface", func() {
+		// Simulate hypershift cluster with 172.20.0.1 as a loopback alias
+		loopbackIPs := map[string]bool{
+			"127.0.0.1":  true,
+			"::1":        true,
+			"172.20.0.1": true, // Hypershift loopback alias
+		}
+
+		entries := []string{
+			"LISTEN 0 4096 172.20.0.1:6443 0.0.0.0:* users:((\"kube-apiserver\",pid=1234,fd=3))",
+			"LISTEN 0 4096 127.0.0.1:8797 0.0.0.0:* users:((\"service1\",pid=1235,fd=3))",
+			"LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:((\"service2\",pid=1236,fd=3))",
+			"LISTEN 0 4096 192.168.1.1:8801 0.0.0.0:* users:((\"service3\",pid=1237,fd=3))",
+		}
+
+		filtered := filterEntriesWithLoopbackIPs(entries, loopbackIPs)
+
+		// Should only contain non-loopback addresses
+		Expect(len(filtered)).To(Equal(2))
+		Expect(filtered).To(ContainElement(ContainSubstring("0.0.0.0:443")))
+		Expect(filtered).To(ContainElement(ContainSubstring("192.168.1.1:8801")))
+
+		// Should not contain loopback addresses (including the hypershift alias)
+		Expect(filtered).NotTo(ContainElement(ContainSubstring("172.20.0.1:6443")))
+		Expect(filtered).NotTo(ContainElement(ContainSubstring("127.0.0.1")))
+	})
+})

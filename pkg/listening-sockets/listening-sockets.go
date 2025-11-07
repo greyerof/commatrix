@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"path"
 	"regexp"
 	"strconv"
@@ -149,8 +150,15 @@ func (cc *ConnectionCheck) createSSOutputFromNode(debugPod *corev1.Pod, group st
 		return nil, nil, nil, err
 	}
 
-	ssOutFilteredTCP := filterEntries(splitByLines(ssOutTCP))
-	ssOutFilteredUDP := filterEntries(splitByLines(ssOutUDP))
+	// Get loopback IPs from the node (via the debug pod)
+	loopbackIPs, err := cc.getLoopbackIPsFromNode(debugPod)
+	if err != nil {
+		log.Warningf("failed to get loopback IPs from node %s: %v", debugPod.Spec.NodeName, err)
+		loopbackIPs = make(map[string]bool)
+	}
+
+	ssOutFilteredTCP := filterEntriesWithLoopbackIPs(splitByLines(ssOutTCP), loopbackIPs)
+	ssOutFilteredUDP := filterEntriesWithLoopbackIPs(splitByLines(ssOutUDP), loopbackIPs)
 
 	tcpComDetails := cc.toComDetails(debugPod, ssOutFilteredTCP, "TCP", group)
 	udpComDetails := cc.toComDetails(debugPod, ssOutFilteredUDP, "UDP", group)
@@ -160,6 +168,47 @@ func (cc *ConnectionCheck) createSSOutputFromNode(debugPod *corev1.Pod, group st
 	res = append(res, tcpComDetails...)
 
 	return res, ssOutTCP, ssOutUDP, nil
+}
+
+// getLoopbackIPsFromNode queries the network interfaces from inside the debug pod to get all IPs assigned to loopback interfaces on that node
+func (cc *ConnectionCheck) getLoopbackIPsFromNode(debugPod *corev1.Pod) (map[string]bool, error) {
+	// Use 'ip addr show lo' to get all IPs assigned to the loopback interface
+	// This will include aliases like lo:0, lo:1, etc.
+	out, err := cc.podUtils.RunCommandOnPod(debugPod, []string{"/bin/sh", "-c", "ip addr show lo"})
+	if err != nil {
+		return nil, fmt.Errorf("failed to run 'ip addr show lo': %w", err)
+	}
+
+	loopbackIPs := make(map[string]bool)
+
+	// Parse the output to extract IP addresses
+	// Example output:
+	// 1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+	//     link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+	//     inet 127.0.0.1/8 scope host lo
+	//        valid_lft forever preferred_lft forever
+	//     inet 172.20.0.1/32 scope host lo:0
+	//        valid_lft forever preferred_lft forever
+	//     inet6 ::1/128 scope host
+	//        valid_lft forever preferred_lft forever
+
+	lines := strings.Split(string(out), "\n")
+	inetRegex := regexp.MustCompile(`^\s+inet6?\s+([0-9a-fA-F:.]+)`)
+
+	for _, line := range lines {
+		matches := inetRegex.FindStringSubmatch(line)
+		if len(matches) >= 2 {
+			ipStr := matches[1]
+			// Parse to ensure it's a valid IP and normalize it
+			ip := net.ParseIP(ipStr)
+			if ip != nil {
+				loopbackIPs[ip.String()] = true
+			}
+		}
+	}
+
+	log.Debugf("Found loopback IPs on node %s: %v", debugPod.Spec.NodeName, loopbackIPs)
+	return loopbackIPs, nil
 }
 
 func splitByLines(bytes []byte) []string {
@@ -267,10 +316,69 @@ func extractPID(ssEntry string) (string, error) {
 	return pid, nil
 }
 
+// getLoopbackIPs returns all IP addresses assigned to loopback interfaces
+func getLoopbackIPs() (map[string]bool, error) {
+	loopbackIPs := make(map[string]bool)
+
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, iface := range interfaces {
+		// Check if this is a loopback interface
+		if iface.Flags&net.FlagLoopback == 0 {
+			continue
+		}
+
+		// Get all addresses for this loopback interface
+		addrs, err := iface.Addrs()
+		if err != nil {
+			log.Debugf("failed to get addresses for interface %s: %v", iface.Name, err)
+			continue
+		}
+
+		for _, addr := range addrs {
+			// addr is in the format "IP/mask", extract just the IP
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			if ip != nil {
+				loopbackIPs[ip.String()] = true
+			}
+		}
+	}
+
+	return loopbackIPs, nil
+}
+
+// filterEntries filters out loopback entries using locally available network interfaces
 func filterEntries(ssEntries []string) []string {
+	// Get all IPs assigned to loopback interfaces
+	loopbackIPs, err := getLoopbackIPs()
+	if err != nil {
+		log.Warningf("failed to get loopback IPs, falling back to standard loopback detection: %v", err)
+		loopbackIPs = make(map[string]bool)
+	}
+
+	return filterEntriesWithLoopbackIPs(ssEntries, loopbackIPs)
+}
+
+// filterEntriesWithLoopbackIPs filters out ss entries that are listening on loopback interfaces
+func filterEntriesWithLoopbackIPs(ssEntries []string, loopbackIPs map[string]bool) []string {
 	res := make([]string, 0)
 	for _, s := range ssEntries {
-		if strings.Contains(s, "127.0.0") || strings.Contains(s, "::1") || s == "" {
+		if s == "" {
+			continue
+		}
+
+		// Check if the entry is listening on a loopback address
+		if isLoopbackEntry(s, loopbackIPs) {
 			continue
 		}
 
@@ -278,6 +386,59 @@ func filterEntries(ssEntries []string) []string {
 	}
 
 	return res
+}
+
+// isLoopbackEntry checks if an ss entry is listening on a loopback interface or its aliases
+func isLoopbackEntry(ssEntry string, loopbackIPs map[string]bool) bool {
+	fields := strings.Fields(ssEntry)
+	if len(fields) <= localAddrPortFieldIdx {
+		return false
+	}
+
+	// Extract the local address from the ss entry
+	// Format is typically "IP:PORT" or "[IPv6]:PORT"
+	localAddrPort := fields[localAddrPortFieldIdx]
+
+	// Remove brackets if present (IPv6 format)
+	localAddrPort = strings.Trim(localAddrPort, "[]")
+
+	// Extract IP address (everything before the last colon)
+	lastColonIdx := strings.LastIndex(localAddrPort, ":")
+	if lastColonIdx == -1 {
+		return false
+	}
+
+	ipStr := localAddrPort[:lastColonIdx]
+
+	// Parse the IP address
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		// If parsing fails, fall back to simple string checks for safety
+		return strings.Contains(ssEntry, "127.") || strings.Contains(ssEntry, "::1")
+	}
+
+	// First check if IP is in the standard loopback range
+	if ip.IsLoopback() {
+		return true
+	}
+
+	// Then check if the IP is assigned to any loopback interface
+	// Need to check both the parsed IP string and its canonical form
+	if loopbackIPs[ip.String()] {
+		return true
+	}
+
+	// For IPv6, also check the canonical form without zone
+	if ip.To4() == nil {
+		// It's IPv6, check without zone
+		if idx := strings.Index(ip.String(), "%"); idx != -1 {
+			if loopbackIPs[ip.String()[:idx]] {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func parseComDetail(ssEntry string) *types.ComDetails {
